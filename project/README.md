@@ -12,43 +12,23 @@ transactions, that can:
 
 It does this by **splitting the problem in two**:
 
-- things that are **semantic / human** → handled by the **LLM**
-- things that are **relational / deterministic / business rules** → kept in
+- things that are **semantic / human** → we let the **LLM** handle it
+- things that are **relational / deterministic / business rules** → we keep in
   **Python** (pandas)
 
 That split is what makes the whole thing work on new CSVs and still stay safe.
 
-**And it comes in two versions** — the same bot, wired two different ways. The
-key difference is **who decides which action to take**:
-
 | Philosophy | Who routes? | File |
 | ---------- | ----------- | ---- |
-| **You orchestrate** — a router | **You** — classify the intent, then a hand-written `if/elif` dispatches | [`Old_LLM_BOT/main.py`](Old_LLM_BOT/main.py) |
-| **The model orchestrates** — tool calling | **The model** — you hand it tools and it picks which to call | [`LLM_BOT/main_tools.py`](LLM_BOT/main_tools.py) |
+| **Philosophy 1 — Router** | **You** — classify the intent, then a hand-written `if/elif` dispatches | [`Old_LLM_BOT/main.py`](Old_LLM_BOT/main.py) |
+| **Philosophy 2 — Tool calling** | **The model** — you hand it tools and it picks which to call | [`LLM_BOT/main_tools.py`](LLM_BOT/main_tools.py) |
 
-They are **two schools, not two stages** — neither is "more advanced". They're a
-tradeoff (see the comparison), and both are used in production today. Underneath,
-the **deterministic core is identical** — the same pandas that owns isolation,
-aggregations, and the dispute rules. Only *who chooses the action* changes:
-
-```mermaid
-flowchart TD
-    Core["deterministic core (pandas)<br/>customer isolation · aggregations · dispute rules<br/>— identical in both"]
-    Core --> P1["Philosophy 1 · You orchestrate<br/>router: classify → if/elif<br/>(Old_LLM_BOT/main.py)"]
-    Core --> P2["Philosophy 2 · The model orchestrates<br/>tool calling<br/>(LLM_BOT/main_tools.py)"]
-    P2 --> MCP["MCP (MCP_BOT/server.py)<br/>= how you package & share Philosophy 2's tools"]
-```
-
-> The two examples happen to run on different providers (Philosophy 1 on **OpenAI**,
-> Philosophy 2 on **Claude**), but that's incidental — the architecture is what
-> matters. There's also [`LLM_BOT/main.py`](LLM_BOT/main.py), a Claude port of the
-> *router* philosophy (typed structured outputs + an offline fallback); kept in the
-> repo but not the focus here.
-
-> **Reading order.** The sections above the fold — from here through **MCP** — are the
-> spine. The deeper dives (RAG, observability, multi-agent, safety, privacy,
-> testing) live under [**Going deeper**](#going-deeper); how to run it on your machine
-> is under [**Running it**](#running-it).
+These are **two schools, not two stages** — neither is "more advanced"; both are
+used in production today. The two bots happen to run on different providers (the
+router on **OpenAI**, the tool bot on **Claude**), but that's incidental — the
+architecture is what matters. And because Philosophy 2's actions are plain Python
+tools, they can be packaged and shared: the final section shows them served over
+[MCP](#mcp--delivering-philosophy-2) to any MCP client, such as Claude Desktop.
 
 ---
 
@@ -122,62 +102,71 @@ Whichever way you route, the split underneath is identical:
 - **Exact aggregations** — `sum` / `count` / `top_n` / `group_by_category` / `min_date` / `max_date`
 - **Business rules** — no disputes on ATM/fees, not older than 90 days, **4 reasons only**
 
-Every number is computed in pandas, so the model can never report a figure that
-disagrees with the data, and it can never see another customer's transactions.
-**Router or tool calling, this core never changes** — only *who chooses the
-action* does.
-
 ---
 
 ## Approach 1 — Router (`Old_LLM_BOT/main.py`)
 
-You ask the LLM one question ("what does the user want?"), then **your code**
-decides what runs.
-
-```mermaid
-flowchart TD
-    U(["User (CLI)"]) --> H["handle_user_query(customer_id, question)"]
-    H --> C["classify intent<br/>[API] call #1 · classify_intent (LLM)"]
-    C -. on failure .-> KW["keyword fallback<br/>(no API call)"]
-    C --> B{"branch<br/>on intent"}
-    KW --> B
-    B -->|spend| S["parse a structured query, then pandas<br/>→ 1–2 more API calls (see Spend)"]
-    B -->|explain| E["customer-scoped lookup<br/>→ 0 further API calls"]
-    B -->|dispute| D["rules → 4 reasons → JSON ticket<br/>→ 0 further API calls"]
+```
+User (CLI)
+  │
+  ├─▶ (1) read current_customer from CLI
+  │
+  ├─▶ (2) user types question
+  │
+  └─▶ handle_user_query(customer_id, question)
+        │
+        ├─▶ try: azure_classify_intent(...)   ← LLM call
+        │        │
+        │        └─▶ returns { intent: "spend" | "explain" | "dispute",
+        │                      normalized_question: "..."}
+        │
+        ├─▶ if LLM failed → detect_intent_legacy(...)
+        │
+        ├─▶ branch on intent
+        │     ├─ "spend"   → spend path
+        │     ├─ "explain" → explain path
+        │     └─ "dispute" → dispute path
+        │
+        └─▶ return JSON to CLI (printed)
 ```
 
-*(Prefer text? the ASCII version of every diagram is collected in
-[Going deeper → The diagrams as ASCII](#the-diagrams-as-ascii-text-versions).)*
+> **Naming note:** the `azure_*` prefix is historical — the bot originally ran on
+> Azure; the calls now go to the **OpenAI API** (this is also the "GPT" referenced
+> below).
 
-The control flow is **written by you** and fixed: you can read the `if/elif` and
-know exactly what can happen. Structure comes from the LLM as JSON constrained by
-a schema (the `_azure_post` call sends a JSON schema; the Claude port expresses
-the same shapes as Pydantic models).
+### Why this design?
 
-### Why this shape
+**We only ask the LLM what it’s good at.**  
+The LLM decides what the user wants (**spend / explain / dispute**) and normalizes the question. Everything that must be strict (filtering, summing, 90-day rule) stays in **Python**.
 
-- **You only ask the LLM what it's good at.** It decides intent and normalises the
-  question; everything strict (filtering, summing, the 90-day rule) stays in Python.
-- **Each path is separate** and can be developed/tested on its own:
-  spend → LLM → structured query → pandas; explain → customer-only lookup →
-  grounded text; dispute → interactive, 4 fixed reasons, JSON.
-- **Sticky customer.** The `customerId` is read once and kept, so "I'd like to
-  dispute that" works without repeating it.
-- **Graceful degradation.** If the LLM call fails, a keyword classifier takes over
-  so the CLI always returns *something*.
-- **Isolation is central.** Because routing happens in one place, each path filters
-  to this customer's rows and never lets the LLM guess other people's data.
+**Each path can be developed separately.**
 
-Each path — **spend**, **explain**, **dispute** — is broken down step-by-step (with
-the exact API-call count per path, and the `(1)–(4)` steps inside
-`execute_spend_query`) in
-[Going deeper → The three paths in detail](#the-three-paths-in-detail-approach-1).
+- **Spend path** → LLM → structured query → pandas  
+- **Explain path** → customer-only lookup → grounded explanation  
+- **Dispute path** → interactive, 4 fixed reasons, JSON output  
+
+Because they’re separate, they don’t step on each other.
+
+**Sticky customer = realistic banking flow.**  
+We read the `customerId` once and keep it. That makes follow-up turns like “I would like to dispute” possible **without** repeating the ID.
+
+**Graceful degradation.**  
+If `azure_classify_intent(...)` fails (bad response, schema mismatch, rate limit), we don’t crash — we fall back to `detect_intent_legacy(...)` (a simple Python classifier). So the CLI always returns *something*.
+
+**Easy to log and demo.**  
+At the router we could log:
+
+- what the user asked  
+- what the LLM thought the intent was  
+- which path was executed  
+
+That makes it very clear to a reviewer where mistakes come from.
+
+**Security / isolation stays central.**  
+Because routing happens in one place, we can enforce “only look at **this** customer’s transactions” in each path, and never let the LLM “guess” other people’s data.
+
 
 ### The JSON flowing through (worked example)
-
-The router's key advantage: you can see the **exact structured object at every hop**,
-and which step was LLM vs. pandas. For *"how much did I spend on groceries in
-2025?"* (customer `CUST031`):
 
 ```mermaid
 flowchart TD
@@ -187,13 +176,150 @@ flowchart TD
     SQ -->|execute_spend_query · pandas| R["result<br/>type: 'sum' · transaction_count: 20<br/>total_amount_dkk: 14683.23"]
     R -->|build_spend_explanation| RESP["response (printed JSON)<br/>intent · interpreted_query · result ·<br/>explanation: 'You spent 14683.23 DKK in category Groceries…'"]
 ```
+---
+### Spend path
 
-Each arrow is a **traceable transformation**: text → intent → a structured query →
-an exact pandas result → a grounded sentence. If an answer is ever wrong, you can
-point at the exact hop that produced the bad object — the LLM misread the intent,
-or the query, or the number came out fine but the wording drifted. That
-step-by-step observability is what the router buys you; in tool calling the model
-makes those choices *inside* one loop, so the trail is less explicit.
+```text
+SPEND path
+  │
+  ├─▶ azure_chat_structured(normalized_question, customer_id)   ← LLM call
+  │      │
+  │      └─▶ returns structured query:
+  │             {
+  │               "intent": "spend_query",
+  │               "customer_id": "...",
+  │               "relational_filters": {...},
+  │               "semantic_filters": {...},
+  │               "aggregation": {
+  │                  "type": "sum" | "count" | "top_n" |
+  │                          "group_by_category" | "min_date" | "max_date"
+  │               },
+  │               "raw_question": "..."
+  │             }
+  │
+  ├─▶ execute_spend_query(query)
+  │      │
+  │      ├─▶ (1) load df = get_transactions_df()
+  │      ├─▶ (2) filter to this customerId
+  │      ├─▶ (3) apply **RELATIONAL** filters
+  │      │       • date_ranges → OR over ranges
+  │      │       • last_n_days → now - N (or data-relative)
+  │      │       • date_from / date_to
+  │      │       • category (lowercased)
+  │      │       • merchantCode_exact
+  │      ├─▶ (4) apply **SEMANTIC** merchant
+  │      │       • if semantic_filters.merchant_text:
+  │      │             – collect candidate merchantCodes
+  │      │             – azure_resolve_merchant(user_text, candidates)   ← LLM call (only if fuzzy)
+  │      │             – else fallback to substring
+  │      └─▶ (5) aggregation switch
+  │              • sum / count / top_n / group_by_category
+  │              • min_date → earliest tx
+  │              • max_date → latest tx
+  │
+  ├─▶ build_spend_explanation(...)
+  │
+  └─▶ return {
+         "intent": "spend",
+         "interpreted_query": ...,
+         "result": ...,
+         "explanation": "..."
+       }
+```
+
+Together with the classify call in the overview, a spend turn makes up to
+**three** LLM calls — classify, parse the query, resolve the merchant (the third
+only when the merchant is fuzzy). See
+[How many API calls per turn?](#how-many-api-calls-per-turn).
+
+### Explain path
+```text
+EXPLAIN path
+  │
+  ├─▶ handle_explain(customer_id, question)
+  │      │
+  │      ├─▶ find_transactions_for_user(...)
+  │      │       • strip "what is", "explain", "hvad er", ...
+  │      │       • if TX... → exact id match
+  │      │       • else → substring on merchantCode (for THIS customer only)
+  │      │
+  │      ├─▶ if no match → "Unknown merchant, please contact support."
+  │      │
+  │      ├─▶ else → pick first, save in LAST_TX_BY_CUSTOMER[customerId]
+  │      │
+  │      └─▶ _build_grounded_explanation_from_tx(tx)
+  │             • if merchantCode in MERCHANT_MAP → friendly text
+  │             • else → "Unknown merchant, please contact support."
+  │
+  └─▶ return JSON
+```
+---
+### Dispute path
+
+The "4 reasons" are a fixed policy whitelist (`ALLOWED_DISPUTE_REASONS` in the
+router, `DISPUTE_REASONS` in the tool bot) — a dispute must resolve to exactly one
+of them:
+
+1. Fraudulent transaction
+2. Duplicate charge
+3. Goods/services not received
+4. Wrong amount charged
+
+```text
+DISPUTE path
+  │
+  ├─▶ handle_dispute(customer_id, question)
+  │      │
+  │      ├─▶ check DISPUTE_SESSIONS[customer_id]
+  │      │      ├─ if status == "awaiting_reason":
+  │      │      │      • _parse_dispute_reason(...)
+  │      │      │      • if no reason → ask again (list 4)
+  │      │      │      • else → status = "awaiting_details"
+  │      │      │
+  │      │      └─ if status == "awaiting_details":
+  │      │             • take user description
+  │      │             • output FINAL JSON:
+  │      │                  { TransactionId, Reason,
+  │      │                    Collected user inputs, Submission timestamp }
+  │      │
+  │      └─▶ (no session) → start new
+  │             • find tx (from text OR LAST_TX_BY_CUSTOMER)
+  │             • check non-disputable (ATM, cash, fees, >90 days)
+  │             • create session = awaiting_reason
+  │             • return list of 4 dispute reasons
+  │
+  └─▶ CLI prints the JSON
+```
+
+### What can (and can’t) be LLM-ified
+
+Not every function in this project should be handed to the LLM. Some parts are **meant** to be fuzzy and language-driven, and some parts **must** stay deterministic because they touch money, rules, or user isolation.
+
+**Note:** you could also design this so that there is **just a single Azure call** per user message that does *everything* (intent + structured spend query + resolve merchant ). 
+In **this demo**, we’ve **split it into several smaller calls** because it’s easier to debug, easier to test each step, and it makes the “semantic vs relational” split very clear.
+
+
+Here’s how the current code breaks down:
+
+| Function / area                       | Can we LLM it?            | Pros                               | Cons                                   |
+| ------------------------------------- | ------------------------- | ---------------------------------- | -------------------------------------- |
+| `azure_classify_intent`               | Already LLM               | flexible intents                   | depends on schema/version              |
+| `azure_chat_structured`               | Already LLM               | rich queries, date ranges          | can fail → fallback                    |
+| `azure_resolve_merchant`              | Already LLM               | fixes misspellings                 | extra call                             |
+| `find_transactions_for_user`          | ✅ yes                     | fuzzier matching, nicer “what is…” | must still filter to user’s own txs    |
+| `_build_grounded_explanation_from_tx` | ✅ yes (with map)         | nicer, localized text              | must forbid hallucination, pass map    |
+| `_parse_dispute_reason`               | ✅ yes                     | handles free-form user text        | still need to whitelist 4 reasons      |
+| `build_spend_explanation`             | ✅ optional                | nicer wording                      | costs more, risk mismatch with numbers |
+| `execute_spend_query`                 | ❌ no                      | —                                  | must be deterministic                  |
+| `_is_nondisputable`                   | ❌ no                      | —                                  | must enforce business rules          |
+| `start_dispute_submission`            | ❌ no                      | —                                  | must output fixed JSON                 |
+| `detect_intent_legacy`                | could drop if LLM is 100% | smaller code                       | but legacy saves you when LLM fails    |
+
+#### How to read this table
+
+- **“Already LLM”** → we’re *already* calling GPT here, because it’s the best tool (intent detection, fuzzy merchant matching).
+- **“✅ yes”** → we *can* push this to GPT to make it smarter/nicer, **but** we should still validate the answer in Python.
+- **“❌ no”** → must stay in Python because it’s either money, rules, or user isolation.
 
 ---
 
@@ -228,7 +354,7 @@ Key properties:
 - The control flow is **decided by the model** at runtime — it can pick a tool,
   chain tools, or ask a clarifying question, none of which you hard-coded.
 - **Python still owns the numbers and rules.** `file_dispute` rejects an ATM
-  charge or a non-whitelisted reason; the model can't override it.
+  charge or a non-whitelisted reason; the model can't talk past it.
 - **`customer_id` is not a tool argument** — the tools read the session's fixed
   customer, so Claude literally cannot query another customer.
 - **The dispute "state machine" isn't written by you** — the model asks for a
@@ -281,14 +407,6 @@ handing routing to the model doesn't weaken the guarantees. It moves the
 *decision of what to do* from your `if/elif` into the model, while the *doing*
 stays in the same pandas functions.
 
-### What a head-to-head run showed
-
-Given the same questions on the same data, the two produce **identical numbers**
-(same pandas core). The differences are all in *control and safety*: the
-tool-calling bot refuses a cross-customer request structurally and lets the model
-drive multi-turn flows; the router is more predictable but you must hand-code
-every branch and every state transition.
-
 ### How many API calls per turn?
 
 The same tradeoff shows up in the **API bill**. In the router, only three
@@ -317,63 +435,11 @@ orchestrates** tradeoff, now visible as tokens spent.
 
 ---
 
-## Under the hood: the Python is the same
-
-The two approaches differ in *who routes* — but the **deterministic Python they
-route into is essentially the same code**. `execute_spend_query` (Approach 1) and
-`query_spending` (Approach 2) are two spellings of one pandas pipeline. One
-diagram describes each capability's Python for **both** approaches; only the
-**entry** (a parsed query object vs. tool-call arguments) differs.
-
-**Spend** — `execute_spend_query(q, customer_id)` ≈ `query_spending(...)`
-
-```mermaid
-flowchart TD
-    E1["Approach 1 · structured query object<br/>(from a separate LLM parse call)"] --> F0
-    E2["Approach 2 · tool-call arguments<br/>(filled by the model)"] --> F0
-    F0["filter to THIS customer<br/>(isolation)"] --> F1["date filters<br/>date_from/to · date_ranges · last_n_days"]
-    F1 --> F2["category filter (exact)"]
-    F2 --> F3["merchant filter<br/>A1: resolve fuzzy text via LLM, else substring<br/>A2: substring (model already chose the text)"]
-    F3 --> F4["aggregate<br/>sum / count / top_n / group_by_category / min_date / max_date"]
-    F4 --> R(["result — numbers from pandas"])
-```
-
-**Explain** — `find_transactions_for_user` + grounded text ≈ `explain_transaction`
-
-```mermaid
-flowchart TD
-    E1["Approach 1 · explain path (question)"] --> L
-    E2["Approach 2 · explain_transaction(reference)"] --> L
-    L["look up within THIS customer's rows<br/>(TX id, or merchant text)"] --> M{"match?"}
-    M -->|no| N(["not found on your account"])
-    M -->|yes| G(["grounded facts<br/>merchant label if known, else raw transaction"])
-```
-
-**Dispute** — `handle_dispute` + rules ≈ `file_dispute`
-
-```mermaid
-flowchart TD
-    E1["Approach 1 · Python state machine<br/>collects reason + details across turns"] --> C0
-    E2["Approach 2 · file_dispute(reference, reason)<br/>model collected the reason in chat"] --> C0
-    C0["find tx (this customer)"] --> C1{"non-disputable?<br/>ATM/fees · >90 days"}
-    C1 -->|yes| R1(["refuse"])
-    C1 -->|no| C2{"reason one of the 4?"}
-    C2 -->|no| R2(["reject / re-ask"])
-    C2 -->|yes| T(["build FINAL JSON ticket"])
-```
-
-The **rule checks are identical**; the only real difference is that Approach 1
-owns the multi-turn dispute *state machine* in Python, while Approach 2 lets the
-model collect the reason in conversation and calls `file_dispute` once. In other
-words: **the routing differs, the pandas doesn't.**
-
----
-
 ## MCP — delivering Philosophy 2
 
 [`MCP_BOT/server.py`](MCP_BOT/server.py) exposes the **same three tools** over the
 **Model Context Protocol**, so *any* MCP client
-(Claude Desktop, Claude Code, another agent) can use them — not just this project's CLI. The
+(Claude Desktop, Claude Code, another agent) can use them — not just our CLI. The
 tool bodies are reused **verbatim** from `main_tools.py` (via
 `main_tools.query_spending.func`, etc.); only the delivery changes.
 
@@ -398,84 +464,6 @@ model chooses which tool, Python still owns the numbers, the rules, and isolatio
 
 # Going deeper
 
-The spine above is the story. These sections are the deeper dives — the design
-reasoning, the safety/privacy posture, the analytics tradeoffs, and the ASCII
-versions of every diagram.
-
-## The three paths in detail (Approach 1)
-
-The router overview in the spine shows *that* it branches spend / explain / dispute.
-This is the step-by-step of each branch — and, importantly, **how many LLM calls
-each one costs.**
-
-**[API] marks an LLM API call.** Every turn starts with **call #1 · classify intent**;
-each path below then adds *zero, one, or two* more. That's why the three paths cost
-different amounts — see [How many API calls per turn?](#how-many-api-calls-per-turn)
-
-**Spend** — the most expensive path (up to **3** API calls)
-
-```mermaid
-flowchart TD
-    Q(["question<br/>(already classified — [API] call #1)"]) --> P["parse a structured query<br/>[API] call #2 · azure_chat_structured (LLM)"]
-    P --> ESQ
-
-    subgraph ESQ["execute_spend_query(query, customer_id) — pandas, THIS customer only"]
-        direction TB
-        F1["(1) filter to customerId<br/>(isolation)"] --> F2["(2) RELATIONAL filters<br/>date ranges / last_n_days / category / exact code"]
-        F2 --> F3["(3) SEMANTIC merchant<br/>[API] call #3 · azure_resolve_merchant — ONLY if fuzzy text<br/>else plain substring (no API call)"]
-        F3 --> F4["(4) aggregate<br/>sum / count / top_n / group_by_category / min_date / max_date"]
-    end
-
-    ESQ --> S(["plain-language summary<br/>(numbers from pandas)"])
-```
-
-So a spend turn fires up to **three** LLM calls — **#1** classify, **#2** parse the
-query, **#3** resolve the merchant — but **#3 only happens for a fuzzy merchant**
-like "netflix"; an exact category (or no merchant) skips it, so that's the 2-call
-case. Everything inside the `execute_spend_query` box — steps (1)–(4) — is **pandas,
-no API calls**.
-
-**Explain** — 1 API call total (just the classify)
-
-```mermaid
-flowchart TD
-    Q(["question<br/>(already classified — [API] call #1)"]) --> L["find_transactions_for_user(customer_id, question)<br/>strip filler · extract TX id or merchant text<br/>resolve ONLY within this customer's rows<br/>(pure Python — no API call)"]
-    L --> M{"match?"}
-    M -->|no| N(["couldn't find that transaction<br/>on your account"])
-    M -->|yes| G(["grounded explanation from the facts<br/>(remembered for a follow-up dispute)"])
-```
-
-The lookup is deterministic string matching, so **explain adds no further calls** —
-the whole turn is just the one classify.
-
-**Dispute** (stateful — a small state machine you write; 1 API call total)
-
-The "4 reasons" are a fixed policy whitelist (`ALLOWED_DISPUTE_REASONS` in the
-router, `DISPUTE_REASONS` in the tool bot) — a dispute must resolve to exactly one
-of them:
-
-1. Fraudulent transaction
-2. Duplicate charge
-3. Goods/services not received
-4. Wrong amount charged
-
-```mermaid
-flowchart TD
-    Q(["message<br/>(already classified — [API] call #1)"]) --> A{"active dispute<br/>session?"}
-    A -->|no session| N1["find tx<br/>(from text or last-viewed)"]
-    N1 --> ND{"non-disputable?<br/>ATM/cash/fees · >90 days"}
-    ND -->|yes| R(["refuse with reason"])
-    ND -->|no| OP(["open session ·<br/>list the 4 reasons"])
-    A -->|awaiting_reason| PR["parse reason<br/>(keyword match — no API call)"]
-    PR --> V{"one of the 4?"}
-    V -->|no| RE(["re-ask (list the 4)"])
-    V -->|yes| AD(["→ awaiting_details"])
-    A -->|awaiting_details| DE(["take description →<br/>emit FINAL JSON ticket"])
-```
-
-The reason is parsed by **keyword matching, not the LLM**, so — like explain —
-dispute adds **no further API calls** beyond the classify.
-
 ## Why not plain RAG?
 
 A natural first instinct is RAG: embed the CSV rows and let the model answer from
@@ -486,7 +474,7 @@ the retrieved chunks. For **exact numbers that doesn't work**, for two reasons:
 - **In-model arithmetic** — even with the rows in context, the LLM sums them in
   its head, and LLMs are unreliable at adding many numbers.
 
-The solution is the pattern this project uses: **let the model write a *query*, run it
+The fix is the pattern this project uses: **let the model write a *query*, run it
 deterministically, and feed the result back.** That is still retrieval-augmented
 generation — the retriever is just a database / pandas query instead of a vector
 search (a.k.a. *text-to-SQL*):
@@ -517,26 +505,26 @@ decides *when* to retrieve and calls a retrieval *tool* (`query_spending`) whose
 ## Observability & analytics at scale
 
 Run either bot millions of times and you'll want to ask "what are people doing?"
-The two approaches differ in what's easy to measure — but less than it might seem.
+The two approaches differ in what's easy to measure — but less than you'd think.
 
 **Per-step statistics are equally easy.** Every step in *both* is structured JSON
 with a known schema — the router's `SpendQuery` and the tool-calling
 `query_spending` input are the same shape (see the two worked examples above). So
 "% of spend queries that group by category", "distribution of dispute reasons",
-"how often groceries is queried" are straightforward in either.
+"how often groceries is queried" are trivial in either.
 
 **Whole-flow statistics are where they diverge.**
 
 - **Router** — one interaction takes one of a *small, fixed* set of paths
   (`classify → parse → execute`, or the dispute state machine). "What path did this
-  go through?" has a handful of answers, bucketing is straightforward, and because routing
+  go through?" has a handful of answers, bucketing is trivial, and because routing
   is deterministic the stats are stable run-to-run.
 - **Tool calling** — the model chooses the sequence at runtime, so a "flow" is a
   *variable-length sequence with a long tail* (one tool call, or three, or a
   clarifying question first). The individual steps are still clean; it's the
   **trajectory** that's high-cardinality — and the same question can route
   differently across runs, adding noise. Flow-level analytics needs real
-  logging/tracing; the router provides it with no extra work.
+  logging/tracing; the router hands it to you for free.
 
 **One more:** the router logs an explicit `intent` field; tool calling has none —
 you *derive* intent from which tool was called. Both work; one is handed to you,
@@ -545,32 +533,7 @@ the other inferred.
 > **In short:** step-level questions ("which aggregations? which dispute reasons?")
 > are equally easy in both. Flow-level questions ("what path did the interaction
 > take?") are free in the router and a logging/tracing job in tool calling — the
-> cost of letting the model choose the sequence.
-
-## What can (and can't) be handed to the LLM
-
-Not every function should be the LLM's job. Some parts are *meant* to be fuzzy and
-language-driven; some *must* stay deterministic because they touch money, rules,
-or user isolation. This is the boundary both approaches respect — the router
-expresses it as functions, the tool-calling bot as tool bodies:
-
-| Function / area                       | LLM it?                   | Why |
-| ------------------------------------- | ------------------------- | --- |
-| classify intent                       | Already LLM               | flexible intents |
-| parse structured spend query          | Already LLM               | rich queries, date ranges (can fail → fallback) |
-| resolve fuzzy merchant                 | Already LLM               | fixes misspellings |
-| find a customer's transactions        | ✅ optional               | fuzzier matching — but must still filter to their own rows |
-| grounded explanation text             | ✅ optional               | improved wording — but must forbid hallucination |
-| parse free-form dispute reason         | ✅ optional               | handles free text — but still whitelist the 4 reasons |
-| spend-result wording                  | ✅ optional               | improved phrasing — but risks mismatching the numbers |
-| execute the spend query               | ❌ **no**                 | must be deterministic (money) |
-| check non-disputable                  | ❌ **no**                 | must enforce the rules |
-| build the dispute ticket JSON         | ❌ **no**                 | must be a fixed shape |
-| customer isolation                    | ❌ **no**                 | must be enforced in code, never the model |
-
-- **Already LLM** → the model is the best tool (intent, fuzzy matching).
-- **✅ optional** → you *can* push it to the model to improve the phrasing, but validate in Python.
-- **❌ no** → stays in Python because it's money, rules, or isolation.
+> price of letting the model choose the sequence.
 
 ## Is Approach 1 multi-agent?
 
@@ -589,13 +552,11 @@ role-specialised steps, each a focused LLM call with a single job:
 Each step has one responsibility and hands a typed object to the next — the
 "distinct roles chained together" pattern.
 
-The honest caveat: these are **specialised steps in a fixed pipeline**, not
+These are **specialised steps in a fixed pipeline**, not
 **autonomous** agents that plan and negotiate. So it's multi-agent in the
 *role-chain* sense, not the *autonomous-agent* sense. The two bots sit on opposite
 corners: **Approach 1 is a multi-role pipeline** (several roles, fixed order);
-**Approach 2 is a single autonomous agent** (one model, dynamic tool use). (The
-original bot was even named *Multi-Agentic-ChatPlatform* — the framing is
-intended.)
+**Approach 2 is a single autonomous agent** (one model, dynamic tool use). 
 
 ## Handling invalid & malicious requests
 
@@ -627,7 +588,7 @@ customer in Python, and refusals carry no data.
 
 ## Testing
 
-An offline `pytest` suite lives in [`tests/`](tests) — **20 tests, no API key
+An offline `pytest` suite lives in [`tests/`](tests) — **23 tests, no API key
 needed**. It asserts the part that must always be correct: **customer isolation**,
 **every spend aggregation against a direct pandas computation**, and the **dispute
 rules** — for *both* bots. (The LLM's routing is validated separately, live.)
@@ -653,80 +614,6 @@ rules — exactly the semantic/deterministic split this whole project is about.
 - **Fixes made while comparing** the two live are logged in
   [`Old_LLM_BOT/ToDo.md`](Old_LLM_BOT/ToDo.md) (data-relative rules, dispute-first
   routing, code-enforced isolation, intent-prompt coverage, and more).
-
-## The diagrams as ASCII (text versions)
-
-The same flows the Mermaid diagrams above show, as plain text — useful for reading
-in a terminal or diffing.
-
-**Approach 1 — Router overview**
-
-```
-User (CLI)
-  │
-  └─▶ handle_user_query(customer_id, question)
-        │
-        ├─▶ classify intent               ← LLM ("spend" | "explain" | "dispute")
-        │      └─ on failure → keyword fallback (detect_intent_legacy)
-        │
-        └─▶ branch on intent (if / elif):
-              ├─ spend   → LLM parses a structured query → pandas executes → summary
-              ├─ explain → customer-scoped lookup → grounded explanation
-              └─ dispute → rules (ATM / 90-day) → 4 reasons → JSON ticket
-```
-
-**Spend path** — note the `(1)–(4)` sub-steps inside `execute_spend_query`
-
-```
-SPEND path
-  ├─▶ parse a structured query (LLM):
-  │       { relational_filters {date_from/to, date_ranges, last_n_days,
-  │                             category, merchantCode_exact},
-  │         semantic_filters   {merchant_text},
-  │         aggregation        {type, n} }
-  ├─▶ execute_spend_query(query, customer_id)   ← pandas, this customer only
-  │       (1) filter to customerId
-  │       (2) RELATIONAL: date ranges / last_n_days / category / exact code
-  │       (3) SEMANTIC: resolve merchant_text to a real code (LLM), else substring
-  │       (4) aggregate: sum / count / top_n / group_by_category / min_date / max_date
-  └─▶ build a plain-language summary from the numbers pandas computed
-```
-
-**Explain path**
-
-```
-EXPLAIN path
-  ├─▶ find_transactions_for_user(customer_id, question)
-  │       • strip "what is / explain / …", extract a TX… id or merchant text
-  │       • resolve ONLY within this customer's rows
-  ├─▶ no match → "couldn't find that transaction on your account"
-  └─▶ else → grounded explanation from the transaction facts (remember it for a
-             follow-up dispute)
-```
-
-**Dispute path**
-
-```
-DISPUTE path
-  ├─▶ active session for this customer?
-  │      ├─ awaiting_reason  → parse reason; not one of 4 → re-ask; else → awaiting_details
-  │      └─ awaiting_details → take description → emit FINAL JSON ticket
-  └─▶ no session → find tx (from text OR last-viewed) → check non-disputable
-                   (ATM/cash/fees, >90 days) → open session → list the 4 reasons
-```
-
-**Approach 2 — Tool calling overview**
-
-```
-User (CLI)
-  │
-  └─▶ tool_runner(system, tools=[query_spending, explain_transaction, file_dispute])
-        │
-        └─▶ Claude reads the tool descriptions and DECIDES which to call,
-            fills the arguments, reads the result, maybe calls another…
-              │
-              └─ each tool is deterministic Python (same pandas + rules)
-```
 
 ---
 
@@ -761,13 +648,13 @@ BANK_CUSTOMER_ID=CUST031 python server.py     # serves the same tools over MCP
 ```
 (then point Claude Desktop or another MCP client at it — see [`MCP_BOT/README.md`](MCP_BOT/README.md))
 
-Pick a customer id (e.g. `CUST031`) and begin querying. Examples that exercise
+Pick a customer id (e.g. `CUST031`) and ask away. Some things to try that exercise
 each path: *"how much did I spend on groceries in 2025 except January and May?"*
 (spend), *"what is TX70196?"* (explain), *"I don't recognise TX90009"* → follow the
 prompts (dispute).
 
 The Claude router (`LLM_BOT/main.py`) additionally runs **with no API key**, using a
-deterministic keyword fallback — useful for offline demos.
+deterministic keyword fallback — handy for offline demos.
 
 ## Setup on a MacBook Air (M1) with Claude Desktop
 
@@ -842,7 +729,7 @@ python LLM_BOT/main_tools.py           # Claude, tool calling (the focus)
 # or:  python LLM_BOT/main.py           # Claude router — runs even with NO key
 ```
 
-Pick a customer id (e.g. `CUST031`) and begin querying.
+Pick a customer id (e.g. `CUST031`) and ask away.
 
 ### 6. Point Claude Desktop at the MCP server
 
