@@ -1,0 +1,3 @@
+mcp
+pandas
+anthropic   # server.py reuses LLM_BOT/main_tools.py, which imports @beta_tool
